@@ -109,6 +109,24 @@
 
   .burned .ember,
   .burned .ash-tip{display:none}
+
+  .broom{
+    position:absolute;bottom:4vh;left:50%;transform:translateX(-50%);
+    background:transparent;
+    border:1px solid rgba(184,168,132,.3);
+    color:rgba(184,168,132,.6);
+    padding:7px 22px;
+    font:inherit;font-size:12px;letter-spacing:6px;font-weight:300;
+    border-radius:20px;cursor:pointer;
+    opacity:0;pointer-events:none;
+    transition:opacity .6s ease, color .25s, border-color .25s, transform .15s;
+  }
+  .broom.show{ opacity:1; pointer-events:auto; }
+  .broom:hover{
+    color:rgba(220,200,160,.9);
+    border-color:rgba(220,200,160,.55);
+  }
+  .broom:active{ transform:translateX(-50%) scale(.96); }
 </style>
 </head>
 <body>
@@ -125,12 +143,16 @@
     </div>
 
     <div class="hint" id="hint">点 击 焚 香</div>
+    <button class="broom" id="broom" type="button">清 香 灰</button>
   </div>
 
 <script>
 (function(){
-  const TOTAL_MS   = 30 * 60 * 1000;  // 30 分钟
-  const INITIAL_VH = 60;              // 初始香长（vh）
+  // 预览/调试：?fast=60 → 30 秒烧完；默认 1 倍速 = 30 分钟
+  const FAST = Math.max(1, parseFloat(new URLSearchParams(location.search).get("fast")) || 1);
+
+  const TOTAL_MS   = 30 * 60 * 1000 / FAST;  // 默认 30 分钟
+  const INITIAL_VH = 60;                     // 初始香长（vh）
 
   const stage  = document.getElementById("stage");
   const stick  = document.getElementById("stick");
@@ -138,6 +160,8 @@
   const ashTip = document.getElementById("ashTip");
   const timer  = document.getElementById("timer");
   const hint   = document.getElementById("hint");
+  const broom  = document.getElementById("broom");
+  const holder = document.querySelector(".holder");
   const canvas = document.getElementById("smoke");
   const ctx    = canvas.getContext("2d");
 
@@ -155,15 +179,151 @@
   let started=false, startTime=0, lastSpawn=0, prev=performance.now();
   const particles = [];
 
+  // 六种烟形（对照图片）：
+  //  vertical 垂直上升 · burst 断续飘散 · fork 双股交叉
+  //  wave 波浪弧形 · spiral 螺旋上升 · curl 向下回流
+  const MODES = ["vertical","burst","fork","wave","spiral","curl"];
+  let mode = "vertical";
+  let modeStart = 0;
+  const MODE_DURATION = 18000 / FAST;     // 每种烟形持续 18s（按速度缩放）
+
+  function pickMode(){
+    let next;
+    do { next = MODES[(Math.random()*MODES.length)|0]; } while (next === mode);
+    mode = next;
+  }
+
   function emberPos(){
     const r = ember.getBoundingClientRect();
     return { x:r.left+r.width/2, y:r.top+r.height/2 };
   }
 
+  // ====== 香 灰 ======
+  // 燃烧时按比例凋落香灰：30 分钟掉 300 颗 ≈ 每 6 秒一颗（与燃烧体积匹配，按速度缩放）
+  const ASH_INTERVAL = 6000 / FAST;
+  let lastAsh = 0;
+  const fallingAsh = [];      // 正在下落
+  const pileAsh    = [];      // 已堆积
+  const pileBuckets = {};     // 桶状高度图：x 范围 → 堆高
+  let cleaning = false;       // 是否处于清扫淡出动画中
+  let cleanStart = 0;
+  const CLEAN_MS = 800;
+
+  function holderTopY(){
+    return holder.getBoundingClientRect().top;
+  }
+  function holderCenterX(){
+    const r = holder.getBoundingClientRect();
+    return r.left + r.width/2;
+  }
+
+  function dropAsh(now){
+    const ep = emberPos();
+    if (ep.y < -20) return;
+    fallingAsh.push({
+      x:  ep.x + (Math.random()-.5) * 1.2,
+      y:  ep.y + 3,
+      vx: (Math.random()-.5) * .04,
+      vy: 0.03 + Math.random() * .03,
+      size: 1.2 + Math.random() * .7,
+    });
+  }
+
+  function landAsh(a){
+    const cx  = holderCenterX();
+    const top = holderTopY();
+    const offsetX = a.x - cx;
+    // 落点超出香座则丢弃（极少发生，但稳妥）
+    if (Math.abs(offsetX) > 55) return;
+    const bIdx = Math.round(offsetX / 3);
+    const h = pileBuckets[bIdx] || 0;
+    pileAsh.push({
+      x: cx + bIdx * 3 + (Math.random()-.5) * 1.8,
+      y: top - h - a.size * .6,
+      size: a.size,
+      opacity: 0,
+    });
+    pileBuckets[bIdx] = h + a.size * 1.05;
+  }
+
+  function updateAsh(now, dt){
+    // 下落物理
+    for (let i = fallingAsh.length - 1; i >= 0; i--){
+      const a = fallingAsh[i];
+      a.vy += dt * 0.0010;             // 重力
+      a.x  += a.vx * dt;
+      a.y  += a.vy * dt;
+      if (a.y >= holderTopY()){
+        landAsh(a);
+        fallingAsh.splice(i, 1);
+      }
+    }
+    // 堆积的灰渐渐显形
+    for (const p of pileAsh){
+      if (p.opacity < 1) p.opacity = Math.min(1, p.opacity + dt * .004);
+    }
+    // 清扫淡出
+    if (cleaning){
+      const t = (now - cleanStart) / CLEAN_MS;
+      if (t >= 1){
+        pileAsh.length = 0;
+        fallingAsh.length = 0;
+        for (const k in pileBuckets) delete pileBuckets[k];
+        cleaning = false;
+      }
+    }
+  }
+
+  function drawAsh(now){
+    // 全局淡出系数（清扫动画时使用）
+    const fade = cleaning ? Math.max(0, 1 - (now - cleanStart)/CLEAN_MS) : 1;
+    if (fade <= 0) return;
+    // 下落颗粒（带轻微拖影）
+    for (const a of fallingAsh){
+      const g = ctx.createRadialGradient(a.x, a.y, 0, a.x, a.y, a.size*2);
+      g.addColorStop(0,   `rgba(210,205,195,${.85*fade})`);
+      g.addColorStop(.5,  `rgba(170,165,155,${.45*fade})`);
+      g.addColorStop(1,   `rgba(120,115,105,0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, a.size*1.6, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // 堆积的灰
+    for (const p of pileAsh){
+      ctx.fillStyle = `rgba(190, 185, 175, ${(.75 * p.opacity * fade).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function updateBroomVisibility(){
+    const has = pileAsh.length > 0 || fallingAsh.length > 0;
+    if (has && !cleaning) broom.classList.add("show");
+    else broom.classList.remove("show");
+  }
+
+  function cleanAsh(){
+    if (cleaning) return;
+    if (pileAsh.length === 0 && fallingAsh.length === 0) return;
+    cleaning = true;
+    cleanStart = performance.now();
+    broom.classList.remove("show");
+  }
+
   function spawnSmoke(now){
     const p = emberPos();
     if (p.y < -20) return;
+
+    // 断续飘散：成簇喷出，间隔停顿
+    if (mode === "burst"){
+      const ph = (now - modeStart) % 2200;
+      if (ph > 800) return;
+    }
+
     particles.push({
+      mode,
       x:  p.x + (Math.random()-.5) * 1.5,
       y:  p.y - 2,
       vx: (Math.random()-.5) * .15,
@@ -174,6 +334,7 @@
       sway: Math.random() * Math.PI * 2,
       swaySpeed: .0006 + Math.random() * .0008,
       swayAmp: .25 + Math.random() * .4,
+      branch: Math.random() < .5 ? -1 : 1,
       birth: now,
     });
   }
@@ -183,9 +344,60 @@
       const p = particles[i];
       p.life = now - p.birth;
       if (p.life > p.maxLife){ particles.splice(i, 1); continue; }
-      const sway = Math.sin(p.sway + now * p.swaySpeed) * p.swayAmp;
-      p.x += (p.vx + sway) * dt * .06;
-      p.y += p.vy * dt * .06;
+      const t = p.life / p.maxLife;
+
+      let dx = 0;
+      let dy = p.vy;
+
+      switch (p.mode){
+        case "vertical": {
+          // 笔直缓缓上升，几乎不左右摆
+          const sway = Math.sin(p.sway + now*p.swaySpeed) * p.swayAmp * .25;
+          dx = p.vx * .25 + sway;
+          break;
+        }
+        case "burst": {
+          // 成团飘散：自然小幅扩散
+          const sway = Math.sin(p.sway + now*p.swaySpeed) * p.swayAmp;
+          dx = p.vx + sway;
+          break;
+        }
+        case "fork": {
+          // 双股交叉：先笔直，再沿 branch 方向分开
+          const split = t < .25 ? 0 : Math.pow((t - .25) / .75, 1.4);
+          const sway  = Math.sin(p.sway + now*p.swaySpeed) * p.swayAmp * .5;
+          dx = sway + p.branch * split * 2.4;
+          break;
+        }
+        case "wave": {
+          // 波浪弧形：横向大幅 S 摆动，越往上摆幅越大
+          const sway = Math.sin(p.sway + now*p.swaySpeed*1.8) * (p.swayAmp + t * 2.2);
+          dx = sway;
+          break;
+        }
+        case "spiral": {
+          // 螺旋上升：围绕中心轴做圆周振荡，半径随高度增大
+          const radius = .4 + t * 2.8;
+          dx = Math.cos(p.sway + t * Math.PI * 4) * radius;
+          break;
+        }
+        case "curl": {
+          // 向下回流：升起一段后向外侧弯曲并回落
+          if (t < .35){
+            const sway = Math.sin(p.sway + now*p.swaySpeed) * p.swayAmp;
+            dx = sway;
+          } else {
+            const ct = (t - .35) / .65;
+            dx = p.branch * Math.sin(ct * Math.PI * .9) * 2.6;
+            // 上升速度逐步反向变为下沉
+            dy = p.vy * (1 - ct * 1.5);
+          }
+          break;
+        }
+      }
+
+      p.x += dx * dt * .06;
+      p.y += dy * dt * .06;
       p.vy *= .999;
       p.r  += dt * .0025;
     }
@@ -234,14 +446,27 @@
         stick.style.height = "0vh";
         timer.textContent = "香 已 燃 尽";
         started = false;
-      } else if (now - lastSpawn > 55){
-        spawnSmoke(now);
-        lastSpawn = now;
+      } else {
+        if (now - modeStart > MODE_DURATION){
+          modeStart = now;
+          pickMode();
+        }
+        if (now - lastSpawn > 55){
+          spawnSmoke(now);
+          lastSpawn = now;
+        }
+        if (now - lastAsh > ASH_INTERVAL){
+          dropAsh(now);
+          lastAsh = now;
+        }
       }
     }
 
     updateSmoke(now, dt);
+    updateAsh(now, dt);
     drawSmoke();
+    drawAsh(now);
+    updateBroomVisibility();
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
@@ -252,6 +477,9 @@
     startTime = performance.now();
     prev = startTime;
     lastSpawn = 0;
+    lastAsh = startTime;
+    modeStart = startTime;
+    mode = "vertical";                  // 从「垂直上升」开始
     particles.length = 0;
     document.body.classList.remove("burned");
     ember.style.opacity = "1";
@@ -259,6 +487,10 @@
   }
 
   stage.addEventListener("click", ignite);
+  broom.addEventListener("click", (e) => {
+    e.stopPropagation();                // 避免冒泡到 stage 触发 ignite
+    cleanAsh();
+  });
 })();
 </script>
 </body>
